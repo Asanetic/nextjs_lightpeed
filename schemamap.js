@@ -22,9 +22,14 @@
 //   node schemamap.js                                  (all defaults)
 //   node schemamap.js custom-spec.txt                   (different spec file)
 //   node schemamap.js --app=ratepos                     (different appname)
-//   node schemamap.js --base=/api/custom                (different endpoint prefix)
 //   node schemamap.js --out-frontend=... --out-backend=... (different output paths)
 //   node schemamap.js --out=some/single/path.js         (write ONE file only, old behavior)
+//
+// endpoint prefix is no longer a flag: frontend endpoints resolve live via
+// apiRoutes.json (apiRoute.<table.replace(/_/g,'')>.base — same routeKey
+// convention db-cli.js already uses), not a hardcoded "/api/<app>/<table>"
+// guess. Backend entries omit endpoint entirely (resolveJoin never reads
+// it).
 //
 // INPUT FORMAT (one line per table) — same as before:
 //   table:displayField|localCol:otherCol:otherTable(Label),localCol:otherCol:otherTable(Label),...
@@ -90,6 +95,9 @@ function parseArgs(argv) {
 
   args.input = positional[0] || defaultInput;
   args.base = args.base || defaultBase;
+  if (argv.some((a) => a.startsWith('--base='))) {
+    console.warn('NOTE: --base is ignored — endpoints now resolve live via apiRoutes.json (apiRoute.<routeKey>.base) instead of a hardcoded prefix, so there is no longer a base URL to override here.');
+  }
 
   if (args.singleOut) {
     // Explicit --out means "write exactly here and nowhere else" — for
@@ -149,6 +157,55 @@ function buildRunTimestamp() {
   return `${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}-${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}-${pad(d.getMilliseconds(), 3)}`;
 }
 const RUN_TIMESTAMP = buildRunTimestamp();
+
+// Fills in a PLACEHOLDER apiRoutes.json entry for any routeKey a relation
+// points at that has no entry yet — so apiRoute.<routeKey>.base never
+// crashes at runtime just because that table's own schema hasn't been
+// built via db-cli.js yet.
+//
+// Deliberately NOT the same as db-cli.js's updateApiRoutesJson, which
+// always upserts (routes[routeKey] = {...}, unconditional overwrite) —
+// that's correct THERE because it just computed the definitive apiBase
+// for the exact module it's building. Here, schemamap.js is only ever
+// GUESSING at another table's routing (same tableName.replace(/_/g,'')
+// convention, "list" apiListFolder assumed) for a table it isn't
+// building anything for. Overwriting an existing entry could clobber a
+// real apiBase db-cli.js already wrote (e.g. a custom --list-name folder,
+// or an apiListFolder other than "list") with a wrong guess — so an
+// existing key is left completely untouched, even if this guess would
+// produce a different URL. Only a genuinely MISSING key gets a
+// placeholder, and that placeholder gets replaced with the real thing
+// the next time that table's own schema.js is built.
+function ensureApiRoutesEntries(appname, relationEntries) {
+  const routesDir = path.join('app', appname, 'AppRoutes');
+  const routesPath = path.join(routesDir, 'apiRoutes.json');
+
+  let routes = {};
+  if (fs.existsSync(routesPath)) {
+    try {
+      routes = JSON.parse(fs.readFileSync(routesPath, 'utf8'));
+    } catch (err) {
+      console.warn(`WARNING: could not parse existing ${routesPath} (${err.message}) — leaving it untouched, skipping the apiRoutes.json placeholder step.`);
+      return;
+    }
+  }
+
+  const missing = [...new Set(relationEntries.map((e) => e.routeKey))].filter((k) => !routes[k]);
+  if (!missing.length) return;
+
+  missing.forEach((routeKey) => {
+    const base = `/api/${appname}/${routeKey}/list`;
+    routes[routeKey] = {
+      base,
+      delete: `${base}/delete`,
+      import: `/api/${appname}/${routeKey}/import`,
+    };
+  });
+
+  fs.mkdirSync(routesDir, { recursive: true });
+  fs.writeFileSync(routesPath, JSON.stringify(routes, null, 4));
+  console.log(`Added ${missing.length} placeholder apiRoutes.json entr${missing.length === 1 ? 'y' : 'ies'} for: ${missing.join(', ')} (guessed at the default "/list" apiBase — db-cli.js will overwrite each with the real one once that table's own schema.js is actually built).`);
+}
 
 // Same convention as clone-module.js's backupExistingFile: never
 // silently overwrite a generated file — someone may have hand-edited it
@@ -252,7 +309,15 @@ function main() {
         valueField: first.otherCol,
         displayField: targetDisplayField || first.otherCol,
         cacheField: targetDisplayField || first.otherCol,
-        endpoint: `${args.base}/${otherTable}`,
+        // Same convention db-cli.js uses for its default moduleName
+        // (`tableName.replace(/_/g, '')`) — as long as "otherTable"'s
+        // schema was built via db-cli.js's "Build schema.js from a
+        // table" with no custom --list-name prefix, this routeKey will
+        // match the key db-cli.js already wrote into apiRoutes.json for
+        // it, so apiRoute.<routeKey>.base resolves to the real URL at
+        // runtime instead of a hardcoded guess. Custom-prefixed modules
+        // won't match this and need a hand override (see header note).
+        routeKey: otherTable.replace(/_/g, ''),
         label: first.label,
         ambiguous,
         usedBy: [...new Set(matches.map((m) => m.sourceTable))],
@@ -266,15 +331,26 @@ function main() {
 
   relationEntries.sort((a, b) => a.relationKey.localeCompare(b.relationKey));
 
+  ensureApiRoutesEntries(args.appname, relationEntries);
+
   const q = (s) => JSON.stringify(s);
   const isValidIdent = (s) => /^[a-zA-Z_$][a-zA-Z0-9_$]*$/.test(s);
 
-  const entriesSrc = relationEntries.map((e) => {
+  // forFrontend=true  -> endpoint: apiRoute.<routeKey>.base  (live lookup,
+  //                      needs the getApiRoutes import added in sharedHead)
+  // forFrontend=false -> no `endpoint` line at all. resolveJoin() never
+  //                      reads rel.endpoint (it only needs table/
+  //                      valueField/cacheField to build the SQL join), and
+  //                      the backend has no established import path to
+  //                      AppRoutes/apiRoutesHandler, so there's nothing
+  //                      correct to put here — omit rather than guess.
+  const buildEntriesSrc = (forFrontend) => relationEntries.map((e) => {
     const keySrc = isValidIdent(e.relationKey) ? e.relationKey : q(e.relationKey);
+    const routeAccessor = isValidIdent(e.routeKey) ? `apiRoute.${e.routeKey}` : `apiRoute[${q(e.routeKey)}]`;
     const outLines = [
       `  ${keySrc}: {`,
       `    table: ${q(e.table)},`,
-      `    endpoint: ${q(e.endpoint)},`,
+      forFrontend ? `    endpoint: ${routeAccessor}.base,` : null,
       `    valueField: ${q(e.valueField)},`,
       `    displayField: ${q(e.displayField)},`,
       `    cacheField: ${q(e.cacheField)},`,
@@ -286,11 +362,14 @@ function main() {
     return outLines.join('\n');
   }).join('\n\n');
 
+  const entriesSrcFrontend = buildEntriesSrc(true);
+  const entriesSrcBackend = buildEntriesSrc(false);
+
   const reverseSummary = reverse.length
     ? reverse.map((r) => `// ${r.sourceTable} -> child records in ${r.otherTable} (via ${r.otherTable}.${r.otherCol}) "${r.label}"`).join('\n')
     : '// (none detected in this spec)';
 
-  const sharedHead = (outPath) => `// ${path.basename(outPath)}
+  const sharedHead = (outPath, entriesSrc, forFrontend) => `// ${path.basename(outPath)}
 // -------------------------------------------------------------------
 // AUTO-GENERATED by schemamap.js from ${args.input} — do not hand-edit
 // the globalRelations object below. Edit the spec file and rerun:
@@ -303,8 +382,20 @@ function main() {
 // wins, shallow merge over the global default.
 // Unknown relation key throws instead of silently returning undefined
 // (fail loud, not silent).
+//
+// endpoint (frontend only) resolves live via apiRoutes.json/getApiRoutes,
+// keyed by table.replace(/_/g, '') — the SAME default routeKey db-cli.js
+// writes when it builds that table's own schema.js. If that table's
+// schema was built with a custom --list-name prefix, its real
+// apiRoutes.json key won't match this guess — hand-fix that one entry's
+// endpoint here (or re-point it at a literal string) rather than
+// regenerating; schemamap.js has no way to know about a prefix chosen in
+// a different tool's run.
 // -------------------------------------------------------------------
-
+${forFrontend ? `
+import { getApiRoutes } from '../AppRoutes/apiRoutesHandler';
+const apiRoute = getApiRoutes();
+` : ''}
 export const globalRelations = {
 
 ${entriesSrc}
@@ -340,7 +431,7 @@ ${reverseSummary}
   // FRONTEND only gets resolveField — a liveSearch field shape for a
   // module's `fields:` array. No resolveJoin here; the backend join
   // descriptor shape has no reason to exist on this side.
-  const frontendContents = sharedHead(args.outFrontend) + `
+  const frontendContents = sharedHead(args.outFrontend, entriesSrcFrontend, true) + `
 // ALWAYS returns an array — spread it into fields: every time, even when
 // you're only expecting one field back. Consistent shape regardless of
 // arguments means you can never forget the spread and end up with a stray
@@ -402,7 +493,7 @@ export function resolveField(relationKey, overrides = {}, displayOverrides = {})
   // descriptor to spread into a module's `batchMutations:` object. No
   // resolveField here; the liveSearch field shape has no reason to exist
   // on this side.
-  const backendContents = sharedHead(args.outBackend || args.outFrontend) + `
+  const backendContents = sharedHead(args.outBackend || args.outFrontend, entriesSrcBackend, false) + `
 // Use it on the BACKEND schema (in 'batchMutations:'):
 //     ...resolveJoin('staff_id')
 //     ...resolveJoin('related_record_id__app_users', { key: 'related_record_id' })
